@@ -4,7 +4,10 @@ Prompt Score Hub is a small ASP.NET Core web app for collecting, scoring, and sh
 
 ## Features
 
-- Password-protected admin submission area
+- User registration and login
+- First registered user automatically becomes admin
+- Registered users can score and submit conversations
+- Admin users can delete published submissions
 - Math captcha on login
 - Cookie authentication with secure flags
 - Request rate limiting for login and submission endpoints
@@ -28,30 +31,15 @@ dotnet run --project .\ConsoleApp7\ConsoleApp7.csproj
 
 Open the URL printed by `dotnet run`.
 
-In development, if no password is configured, the temporary login password is:
+The first registered account becomes the admin account. Later registered accounts are regular users.
 
-```text
-change-me-now
-```
+## Account Roles
 
-## Security Configuration
+- Visitors can browse, search, filter, and report public submissions.
+- Registered users can preview scores and publish high-scoring conversations.
+- Admin users can do everything regular users can do, plus delete submissions.
 
-For real deployments, do not rely on the development password. Set one of these values:
-
-```powershell
-$env:PROMPT_SHARE_PASSWORD="your-long-random-password"
-dotnet run --project .\ConsoleApp7\ConsoleApp7.csproj
-```
-
-For better secret handling, store a SHA-256 password hash instead:
-
-```powershell
-$bytes = [System.Text.Encoding]::UTF8.GetBytes("your-long-random-password")
-$hash = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes)).ToLower()
-$env:PROMPT_SHARE_PASSWORD_HASH=$hash
-```
-
-Production mode requires `PROMPT_SHARE_PASSWORD_HASH`, `PROMPT_SHARE_PASSWORD`, `AppPasswordHash`, or `AppPassword`.
+Passwords are stored with PBKDF2-SHA256 hashes and per-user salts.
 
 ## Configuration
 
@@ -60,8 +48,6 @@ The following configuration keys are supported:
 - `DatabasePath`: SQLite database path. Defaults to `ConsoleApp7/App_Data/prompt-share.db`.
 - `PassingScore`: Minimum score for public sharing. Defaults to `75`.
 - `MaxConversationLength`: Maximum accepted conversation length. Defaults to `12000`.
-- `AppPassword`: Plaintext password, useful only for local development.
-- `AppPasswordHash`: SHA-256 hash of the password.
 
 ## Notes
 

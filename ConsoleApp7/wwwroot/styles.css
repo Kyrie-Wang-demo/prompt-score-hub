@@ -48,7 +48,9 @@ button:disabled {
 .topbar,
 .section-heading,
 .button-row,
-.item-actions {
+.item-actions,
+.top-actions,
+.auth-tabs {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -205,7 +207,8 @@ textarea:focus {
 
 .primary-button,
 .ghost-button,
-.icon-button {
+.icon-button,
+.tab-button {
   min-height: 42px;
   border-radius: 6px;
   cursor: pointer;
@@ -224,7 +227,8 @@ textarea:focus {
 }
 
 .ghost-button,
-.icon-button {
+.icon-button,
+.tab-button {
   border: 1px solid var(--line);
   background: white;
   color: var(--ink);
@@ -236,6 +240,31 @@ textarea:focus {
 
 .icon-button {
   width: 42px;
+}
+
+.auth-tabs {
+  justify-content: stretch;
+  margin-bottom: 16px;
+}
+
+.tab-button {
+  flex: 1;
+}
+
+.tab-button.active {
+  border-color: var(--accent);
+  background: #eef7f5;
+  color: var(--accent-strong);
+}
+
+.user-pill {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 9px 12px;
+  background: white;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
 }
 
 .text-button {
@@ -256,6 +285,13 @@ textarea:focus {
   margin-bottom: 0;
   color: var(--danger);
   font-size: 14px;
+}
+
+.hint {
+  margin-bottom: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
 }
 
 .score-box {

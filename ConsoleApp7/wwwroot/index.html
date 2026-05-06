@@ -15,6 +15,7 @@
           <h1>Prompt Score Hub</h1>
         </div>
         <div class="top-actions">
+          <span class="user-pill" id="userBadge" hidden></span>
           <button class="ghost-button" id="logoutButton" type="button" hidden>Sign out</button>
         </div>
       </header>
@@ -28,11 +29,19 @@
 
       <div class="content-grid">
         <section class="panel" id="loginPanel">
-          <h2>Admin Login</h2>
+          <h2>Account</h2>
+          <div class="auth-tabs">
+            <button class="tab-button active" id="showLogin" type="button">Sign in</button>
+            <button class="tab-button" id="showRegister" type="button">Register</button>
+          </div>
           <form id="loginForm" class="stack">
             <label>
+              <span>Username</span>
+              <input id="loginUsername" autocomplete="username" placeholder="your-name" required>
+            </label>
+            <label>
               <span>Password</span>
-              <input id="password" type="password" autocomplete="current-password" placeholder="Development password: change-me-now" required>
+              <input id="password" type="password" autocomplete="current-password" required>
             </label>
             <label>
               <span>Captcha</span>
@@ -44,6 +53,27 @@
             </label>
             <button class="primary-button" type="submit">Sign in</button>
             <p class="message" id="loginMessage"></p>
+          </form>
+          <form id="registerForm" class="stack" hidden>
+            <label>
+              <span>Username</span>
+              <input id="registerUsername" autocomplete="username" placeholder="3-24 letters, numbers, _ or -" required>
+            </label>
+            <label>
+              <span>Password</span>
+              <input id="registerPassword" type="password" autocomplete="new-password" minlength="8" placeholder="At least 8 characters" required>
+            </label>
+            <label>
+              <span>Captcha</span>
+              <div class="captcha-row">
+                <strong id="registerCaptchaQuestion">Loading...</strong>
+                <button class="icon-button" id="refreshRegisterCaptcha" type="button" title="Refresh captcha">R</button>
+              </div>
+              <input id="registerCaptchaAnswer" inputmode="numeric" autocomplete="off" placeholder="Answer" required>
+            </label>
+            <button class="primary-button" type="submit">Create account</button>
+            <p class="hint">The first registered account becomes admin. Later accounts can submit but cannot delete.</p>
+            <p class="message" id="registerMessage"></p>
           </form>
         </section>
 

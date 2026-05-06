@@ -42,7 +42,10 @@ builder.Services
         options.ExpireTimeSpan = TimeSpan.FromHours(8);
     });
 
-builder.Services.AddAuthorization();
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("AdminOnly", policy => policy.RequireRole("admin"));
+});
 builder.Services.AddDataProtection();
 
 var app = builder.Build();
@@ -94,21 +97,70 @@ app.MapPost("/api/login", async (
         return Results.BadRequest(new ApiMessage("Invalid or expired captcha."));
     }
 
-    if (!settings.IsPasswordValid(request.Password))
+    if (!IsUsernameValid(request.Username) || string.IsNullOrWhiteSpace(request.Password))
     {
         await Task.Delay(RandomNumberGenerator.GetInt32(120, 280));
-        return Results.BadRequest(new ApiMessage("Incorrect password."));
+        return Results.BadRequest(new ApiMessage("Incorrect username or password."));
+    }
+
+    using var connection = OpenConnection(settings.DatabasePath);
+    var user = FindUser(connection, request.Username!);
+    if (user is null || !VerifyPassword(request.Password, user.PasswordHash, user.PasswordSalt))
+    {
+        await Task.Delay(RandomNumberGenerator.GetInt32(120, 280));
+        return Results.BadRequest(new ApiMessage("Incorrect username or password."));
     }
 
     var claims = new[]
     {
-        new Claim(ClaimTypes.Name, "admin"),
-        new Claim(ClaimTypes.Role, "admin")
+        new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
+        new Claim(ClaimTypes.Name, user.Username),
+        new Claim(ClaimTypes.Role, user.Role)
     };
     var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
     await httpContext.SignInAsync(new ClaimsPrincipal(identity));
 
     return Results.Ok(new ApiMessage("Signed in."));
+}).RequireRateLimiting("login");
+
+app.MapPost("/api/register", async (
+    RegisterRequest request,
+    HttpContext httpContext,
+    IDataProtectionProvider protectionProvider) =>
+{
+    if (!IsCaptchaValid(request.CaptchaAnswer, request.CaptchaToken, protectionProvider))
+    {
+        return Results.BadRequest(new ApiMessage("Invalid or expired captcha."));
+    }
+
+    if (!IsUsernameValid(request.Username))
+    {
+        return Results.BadRequest(new ApiMessage("Username must be 3-24 characters and use only letters, numbers, underscore, or dash."));
+    }
+
+    if (string.IsNullOrWhiteSpace(request.Password) || request.Password.Length < 8 || request.Password.Length > 128)
+    {
+        return Results.BadRequest(new ApiMessage("Password must be 8-128 characters."));
+    }
+
+    using var connection = OpenConnection(settings.DatabasePath);
+    if (FindUser(connection, request.Username!) is not null)
+    {
+        return Results.Conflict(new ApiMessage("Username is already taken."));
+    }
+
+    var role = CountUsers(connection) == 0 ? "admin" : "user";
+    var user = CreateUser(connection, request.Username!, request.Password, role);
+    var claims = new[]
+    {
+        new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
+        new Claim(ClaimTypes.Name, user.Username),
+        new Claim(ClaimTypes.Role, user.Role)
+    };
+    var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
+    await httpContext.SignInAsync(new ClaimsPrincipal(identity));
+
+    return Results.Ok(new RegisterResult("Account created.", user.Username, user.Role));
 }).RequireRateLimiting("login");
 
 app.MapPost("/api/logout", async (HttpContext httpContext) =>
@@ -118,7 +170,16 @@ app.MapPost("/api/logout", async (HttpContext httpContext) =>
 });
 
 app.MapGet("/api/me", (ClaimsPrincipal user) =>
-    Results.Ok(new { authenticated = user.Identity?.IsAuthenticated == true }));
+{
+    var authenticated = user.Identity?.IsAuthenticated == true;
+    return Results.Ok(new
+    {
+        authenticated,
+        username = authenticated ? user.Identity?.Name : null,
+        role = authenticated ? user.FindFirstValue(ClaimTypes.Role) : null,
+        canDelete = user.IsInRole("admin")
+    });
+});
 
 app.MapGet("/api/stats", () =>
 {
@@ -214,7 +275,7 @@ app.MapPost("/api/score", (SubmissionRequest request) =>
     return Results.Ok(new ScorePreview(result.Score, result.Feedback, result.Breakdown));
 }).RequireAuthorization().RequireRateLimiting("submit");
 
-app.MapPost("/api/submissions", (SubmissionRequest request) =>
+app.MapPost("/api/submissions", (SubmissionRequest request, ClaimsPrincipal user) =>
 {
     var validation = ValidateSubmission(request, settings);
     if (validation is not null)
@@ -242,7 +303,9 @@ app.MapPost("/api/submissions", (SubmissionRequest request) =>
         VALUES ($title, $author, $tags, $conversation, $contentHash, $score, $feedback, $createdAt, 0)
         """;
     command.Parameters.AddWithValue("$title", request.Title.Trim());
-    command.Parameters.AddWithValue("$author", CleanOptional(request.Author, 40));
+    command.Parameters.AddWithValue("$author", string.IsNullOrWhiteSpace(request.Author)
+        ? user.Identity?.Name ?? ""
+        : CleanOptional(request.Author, 40));
     command.Parameters.AddWithValue("$tags", CleanTags(request.Tags));
     command.Parameters.AddWithValue("$conversation", request.Conversation.Trim());
     command.Parameters.AddWithValue("$contentHash", fingerprint);
@@ -278,7 +341,7 @@ app.MapDelete("/api/submissions/{id:int}", (int id) =>
     return changed == 0
         ? Results.NotFound(new ApiMessage("Submission not found."))
         : Results.Ok(new ApiMessage("Deleted."));
-}).RequireAuthorization();
+}).RequireAuthorization("AdminOnly");
 
 app.MapFallbackToFile("index.html");
 
@@ -335,6 +398,15 @@ static void InitializeDatabase(string databasePath)
             ReportCount INTEGER NOT NULL DEFAULT 0
         );
         CREATE UNIQUE INDEX IF NOT EXISTS IX_Submissions_ContentHash ON Submissions(ContentHash);
+
+        CREATE TABLE IF NOT EXISTS Users (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            Username TEXT NOT NULL UNIQUE,
+            PasswordHash TEXT NOT NULL,
+            PasswordSalt TEXT NOT NULL,
+            Role TEXT NOT NULL DEFAULT 'user',
+            CreatedAt TEXT NOT NULL
+        );
         """;
     command.ExecuteNonQuery();
 
@@ -399,6 +471,87 @@ static bool SubmissionExists(SqliteConnection connection, string fingerprint)
     command.CommandText = "SELECT 1 FROM Submissions WHERE ContentHash = $contentHash LIMIT 1";
     command.Parameters.AddWithValue("$contentHash", fingerprint);
     return command.ExecuteScalar() is not null;
+}
+
+static int CountUsers(SqliteConnection connection)
+{
+    using var command = connection.CreateCommand();
+    command.CommandText = "SELECT COUNT(*) FROM Users";
+    return Convert.ToInt32(command.ExecuteScalar());
+}
+
+static UserAccount? FindUser(SqliteConnection connection, string username)
+{
+    using var command = connection.CreateCommand();
+    command.CommandText = """
+        SELECT Id, Username, PasswordHash, PasswordSalt, Role
+        FROM Users
+        WHERE lower(Username) = lower($username)
+        LIMIT 1
+        """;
+    command.Parameters.AddWithValue("$username", username.Trim());
+
+    using var reader = command.ExecuteReader();
+    if (!reader.Read())
+    {
+        return null;
+    }
+
+    return new UserAccount(
+        reader.GetInt32(0),
+        reader.GetString(1),
+        reader.GetString(2),
+        reader.GetString(3),
+        reader.GetString(4));
+}
+
+static UserAccount CreateUser(SqliteConnection connection, string username, string password, string role)
+{
+    var salt = RandomNumberGenerator.GetBytes(16);
+    var hash = HashPassword(password, salt);
+
+    using var command = connection.CreateCommand();
+    command.CommandText = """
+        INSERT INTO Users (Username, PasswordHash, PasswordSalt, Role, CreatedAt)
+        VALUES ($username, $passwordHash, $passwordSalt, $role, $createdAt)
+        RETURNING Id
+        """;
+    command.Parameters.AddWithValue("$username", username.Trim());
+    command.Parameters.AddWithValue("$passwordHash", Convert.ToBase64String(hash));
+    command.Parameters.AddWithValue("$passwordSalt", Convert.ToBase64String(salt));
+    command.Parameters.AddWithValue("$role", role);
+    command.Parameters.AddWithValue("$createdAt", DateTimeOffset.UtcNow.ToString("yyyy-MM-dd HH:mm:ss 'UTC'"));
+    var id = Convert.ToInt32(command.ExecuteScalar());
+
+    return new UserAccount(id, username.Trim(), Convert.ToBase64String(hash), Convert.ToBase64String(salt), role);
+}
+
+static bool VerifyPassword(string password, string storedHash, string storedSalt)
+{
+    var salt = Convert.FromBase64String(storedSalt);
+    var expectedHash = Convert.FromBase64String(storedHash);
+    var candidateHash = HashPassword(password, salt);
+    return CryptographicOperations.FixedTimeEquals(candidateHash, expectedHash);
+}
+
+static byte[] HashPassword(string password, byte[] salt) =>
+    Rfc2898DeriveBytes.Pbkdf2(
+        password,
+        salt,
+        100_000,
+        HashAlgorithmName.SHA256,
+        32);
+
+static bool IsUsernameValid(string? username)
+{
+    if (string.IsNullOrWhiteSpace(username))
+    {
+        return false;
+    }
+
+    var trimmed = username.Trim();
+    return trimmed.Length is >= 3 and <= 24 &&
+        trimmed.All(character => char.IsLetterOrDigit(character) || character is '_' or '-');
 }
 
 static string Fingerprint(string value)
@@ -474,14 +627,11 @@ static bool HasAny(string text, params string[] words) =>
 
 sealed class AppSettings
 {
-    private readonly byte[] passwordHash;
-
-    private AppSettings(string databasePath, int passingScore, int maxConversationLength, byte[] passwordHash)
+    private AppSettings(string databasePath, int passingScore, int maxConversationLength)
     {
         DatabasePath = databasePath;
         PassingScore = passingScore;
         MaxConversationLength = maxConversationLength;
-        this.passwordHash = passwordHash;
     }
 
     public string DatabasePath { get; }
@@ -493,43 +643,17 @@ sealed class AppSettings
         var databasePath = configuration["DatabasePath"] ?? Path.Combine(environment.ContentRootPath, "App_Data", "prompt-share.db");
         var passingScore = configuration.GetValue("PassingScore", 75);
         var maxConversationLength = configuration.GetValue("MaxConversationLength", 12000);
-        var password = configuration["AppPassword"] ?? Environment.GetEnvironmentVariable("PROMPT_SHARE_PASSWORD");
-        var passwordHash = configuration["AppPasswordHash"] ?? Environment.GetEnvironmentVariable("PROMPT_SHARE_PASSWORD_HASH");
-
-        if (string.IsNullOrWhiteSpace(password) && string.IsNullOrWhiteSpace(passwordHash))
-        {
-            if (!environment.IsDevelopment())
-            {
-                throw new InvalidOperationException("Production requires AppPasswordHash or PROMPT_SHARE_PASSWORD_HASH.");
-            }
-
-            password = "change-me-now";
-            Console.WriteLine("Development login password: change-me-now");
-        }
-
-        var hash = !string.IsNullOrWhiteSpace(passwordHash)
-            ? Convert.FromHexString(passwordHash)
-            : SHA256.HashData(Encoding.UTF8.GetBytes(password!));
-
-        return new AppSettings(databasePath, passingScore, maxConversationLength, hash);
-    }
-
-    public bool IsPasswordValid(string? password)
-    {
-        if (string.IsNullOrEmpty(password))
-        {
-            return false;
-        }
-
-        var candidate = SHA256.HashData(Encoding.UTF8.GetBytes(password));
-        return CryptographicOperations.FixedTimeEquals(candidate, passwordHash);
+        return new AppSettings(databasePath, passingScore, maxConversationLength);
     }
 }
 
 record CaptchaResponse(string Question, string Token);
-record LoginRequest(string? Password, string? CaptchaAnswer, string? CaptchaToken);
+record LoginRequest(string? Username, string? Password, string? CaptchaAnswer, string? CaptchaToken);
+record RegisterRequest(string? Username, string? Password, string? CaptchaAnswer, string? CaptchaToken);
 record SubmissionRequest(string Title, string? Author, string? Tags, string Conversation);
 record ApiMessage(string Message);
+record RegisterResult(string Message, string Username, string Role);
+record UserAccount(int Id, string Username, string PasswordHash, string PasswordSalt, string Role);
 record ScoreBreakdown(string Name, int Points, int MaxPoints, string Note);
 record ScoreResult(int Score, string Feedback, IReadOnlyList<ScoreBreakdown> Breakdown);
 record ScorePreview(int Score, string Feedback, IReadOnlyList<ScoreBreakdown> Breakdown);

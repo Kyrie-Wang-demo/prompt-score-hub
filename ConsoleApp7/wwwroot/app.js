@@ -1,6 +1,10 @@
 const state = {
   authenticated: false,
   captchaToken: "",
+  registerCaptchaToken: "",
+  username: "",
+  role: "",
+  canDelete: false,
   page: 1,
   pageSize: 12
 };
@@ -11,12 +15,19 @@ const elements = {
   loginPanel: $("#loginPanel"),
   submitPanel: $("#submitPanel"),
   logoutButton: $("#logoutButton"),
+  userBadge: $("#userBadge"),
   loginForm: $("#loginForm"),
+  registerForm: $("#registerForm"),
   submitForm: $("#submitForm"),
   filterForm: $("#filterForm"),
+  showLogin: $("#showLogin"),
+  showRegister: $("#showRegister"),
   loginMessage: $("#loginMessage"),
+  registerMessage: $("#registerMessage"),
   captchaQuestion: $("#captchaQuestion"),
+  registerCaptchaQuestion: $("#registerCaptchaQuestion"),
   refreshCaptcha: $("#refreshCaptcha"),
+  refreshRegisterCaptcha: $("#refreshRegisterCaptcha"),
   libraryList: $("#libraryList"),
   reloadButton: $("#reloadButton"),
   previewButton: $("#previewButton"),
@@ -55,16 +66,27 @@ async function loadCaptcha() {
   state.captchaToken = data.token;
 }
 
-async function loadSession() {
-  const data = await api("/api/me");
-  setAuthenticated(data.authenticated);
+async function loadRegisterCaptcha() {
+  const data = await api("/api/captcha");
+  elements.registerCaptchaQuestion.textContent = data.question;
+  state.registerCaptchaToken = data.token;
 }
 
-function setAuthenticated(isAuthenticated) {
-  state.authenticated = isAuthenticated;
-  elements.loginPanel.hidden = isAuthenticated;
-  elements.submitPanel.hidden = !isAuthenticated;
-  elements.logoutButton.hidden = !isAuthenticated;
+async function loadSession() {
+  const data = await api("/api/me");
+  setAuthenticated(data);
+}
+
+function setAuthenticated(session) {
+  state.authenticated = session.authenticated;
+  state.username = session.username || "";
+  state.role = session.role || "";
+  state.canDelete = Boolean(session.canDelete);
+  elements.loginPanel.hidden = state.authenticated;
+  elements.submitPanel.hidden = !state.authenticated;
+  elements.logoutButton.hidden = !state.authenticated;
+  elements.userBadge.hidden = !state.authenticated;
+  elements.userBadge.textContent = state.authenticated ? `${state.username} (${state.role})` : "";
 }
 
 async function loadStats() {
@@ -106,7 +128,7 @@ function renderSubmission(item) {
   const tags = item.tags
     ? `<div class="tags">${item.tags.split(",").map((tag) => `<span>${escapeHtml(tag.trim())}</span>`).join("")}</div>`
     : "";
-  const deleteButton = state.authenticated
+  const deleteButton = state.canDelete
     ? `<button class="text-button danger" data-delete="${item.id}" type="button">Delete</button>`
     : "";
 
@@ -167,17 +189,42 @@ elements.loginForm.addEventListener("submit", async (event) => {
       method: "POST",
       body: JSON.stringify({
         password: $("#password").value,
+        username: $("#loginUsername").value,
         captchaAnswer: $("#captchaAnswer").value,
         captchaToken: state.captchaToken
       })
     });
-    setAuthenticated(true);
     elements.loginForm.reset();
+    await loadSession();
     await loadCaptcha();
     await loadSubmissions();
   } catch (error) {
     elements.loginMessage.textContent = error.message;
     await loadCaptcha();
+  }
+});
+
+elements.registerForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  elements.registerMessage.textContent = "";
+
+  try {
+    await api("/api/register", {
+      method: "POST",
+      body: JSON.stringify({
+        username: $("#registerUsername").value,
+        password: $("#registerPassword").value,
+        captchaAnswer: $("#registerCaptchaAnswer").value,
+        captchaToken: state.registerCaptchaToken
+      })
+    });
+    elements.registerForm.reset();
+    await loadSession();
+    await loadRegisterCaptcha();
+    await loadSubmissions();
+  } catch (error) {
+    elements.registerMessage.textContent = error.message;
+    await loadRegisterCaptcha();
   }
 });
 
@@ -216,8 +263,8 @@ elements.submitForm.addEventListener("submit", async (event) => {
 
 elements.logoutButton.addEventListener("click", async () => {
   await api("/api/logout", { method: "POST" });
-  setAuthenticated(false);
-  await Promise.all([loadCaptcha(), loadSubmissions()]);
+  setAuthenticated({ authenticated: false });
+  await Promise.all([loadCaptcha(), loadRegisterCaptcha(), loadSubmissions()]);
 });
 
 elements.filterForm.addEventListener("submit", async (event) => {
@@ -241,6 +288,21 @@ elements.nextPage.addEventListener("click", async () => {
 });
 
 elements.refreshCaptcha.addEventListener("click", loadCaptcha);
+elements.refreshRegisterCaptcha.addEventListener("click", loadRegisterCaptcha);
+
+elements.showLogin.addEventListener("click", () => {
+  elements.loginForm.hidden = false;
+  elements.registerForm.hidden = true;
+  elements.showLogin.classList.add("active");
+  elements.showRegister.classList.remove("active");
+});
+
+elements.showRegister.addEventListener("click", () => {
+  elements.loginForm.hidden = true;
+  elements.registerForm.hidden = false;
+  elements.showLogin.classList.remove("active");
+  elements.showRegister.classList.add("active");
+});
 
 elements.libraryList.addEventListener("click", async (event) => {
   const reportId = event.target.dataset.report;
@@ -257,4 +319,4 @@ elements.libraryList.addEventListener("click", async (event) => {
   }
 });
 
-Promise.all([loadCaptcha(), loadSession(), loadStats(), loadSubmissions()]);
+Promise.all([loadCaptcha(), loadRegisterCaptcha(), loadSession(), loadStats(), loadSubmissions()]);
