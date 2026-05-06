@@ -1,0 +1,13 @@
+bin/
+obj/
+.vs/
+.vscode/
+*.user
+*.suo
+
+ConsoleApp7/App_Data/
+ConsoleApp7/*.db
+ConsoleApp7/*.db-shm
+ConsoleApp7/*.db-wal
+
+*.log

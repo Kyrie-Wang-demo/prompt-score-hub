@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prompt Score Hub</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="workspace">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Open prompt library</p>
+          <h1>Prompt Score Hub</h1>
+        </div>
+        <div class="top-actions">
+          <button class="ghost-button" id="logoutButton" type="button" hidden>Sign out</button>
+        </div>
+      </header>
+
+      <section class="stats-grid" aria-label="Library statistics">
+        <div><span>Total</span><strong id="statTotal">0</strong></div>
+        <div><span>Average</span><strong id="statAverage">0</strong></div>
+        <div><span>Best</span><strong id="statBest">0</strong></div>
+        <div><span>Pass mark</span><strong id="statPass">75</strong></div>
+      </section>
+
+      <div class="content-grid">
+        <section class="panel" id="loginPanel">
+          <h2>Admin Login</h2>
+          <form id="loginForm" class="stack">
+            <label>
+              <span>Password</span>
+              <input id="password" type="password" autocomplete="current-password" placeholder="Development password: change-me-now" required>
+            </label>
+            <label>
+              <span>Captcha</span>
+              <div class="captcha-row">
+                <strong id="captchaQuestion">Loading...</strong>
+                <button class="icon-button" id="refreshCaptcha" type="button" title="Refresh captcha">R</button>
+              </div>
+              <input id="captchaAnswer" inputmode="numeric" autocomplete="off" placeholder="Answer" required>
+            </label>
+            <button class="primary-button" type="submit">Sign in</button>
+            <p class="message" id="loginMessage"></p>
+          </form>
+        </section>
+
+        <section class="panel" id="submitPanel" hidden>
+          <h2>Submit Conversation</h2>
+          <form id="submitForm" class="stack">
+            <label>
+              <span>Title</span>
+              <input id="title" maxlength="80" placeholder="Support reply improvement" required>
+            </label>
+            <div class="two-col">
+              <label>
+                <span>Author</span>
+                <input id="author" maxlength="40" placeholder="Optional">
+              </label>
+              <label>
+                <span>Tags</span>
+                <input id="tags" maxlength="120" placeholder="support, writing, code">
+              </label>
+            </div>
+            <label>
+              <span>Conversation</span>
+              <textarea id="conversation" rows="14" placeholder="Paste the user and assistant conversation. Strong examples include context, goal, constraints, model answer, and summary." required></textarea>
+            </label>
+            <div class="button-row">
+              <button class="ghost-button" id="previewButton" type="button">Preview score</button>
+              <button class="primary-button" type="submit">Score and publish</button>
+            </div>
+            <div class="score-box" id="scoreBox" hidden>
+              <div>
+                <span>Score</span>
+                <strong id="scoreValue">0</strong>
+              </div>
+              <p id="scoreFeedback"></p>
+              <ul id="scoreBreakdown"></ul>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel library-panel">
+          <div class="section-heading">
+            <div>
+              <h2>Shared Library</h2>
+              <p>High-scoring conversations are visible to everyone.</p>
+            </div>
+            <button class="ghost-button" id="reloadButton" type="button">Refresh</button>
+          </div>
+
+          <form class="filters" id="filterForm">
+            <input id="query" placeholder="Search title, feedback, or conversation">
+            <input id="tagFilter" placeholder="Tag">
+            <select id="minScore">
+              <option value="">Any score</option>
+              <option value="90">90+</option>
+              <option value="80">80+</option>
+              <option value="75">75+</option>
+            </select>
+            <button class="ghost-button" type="submit">Search</button>
+          </form>
+
+          <div class="library-list" id="libraryList"></div>
+          <div class="pager">
+            <button class="ghost-button" id="previousPage" type="button">Previous</button>
+            <span id="pageLabel">Page 1</span>
+            <button class="ghost-button" id="nextPage" type="button">Next</button>
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
