@@ -1,663 +1,554 @@
-using System.Security.Claims;
-using System.Security.Cryptography;
-using System.Text;
-using Microsoft.AspNetCore.Authentication;
-using Microsoft.AspNetCore.Authentication.Cookies;
-using Microsoft.AspNetCore.DataProtection;
-using Microsoft.AspNetCore.HttpOverrides;
-using Microsoft.AspNetCore.RateLimiting;
-using Microsoft.Data.Sqlite;
+using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
-
-builder.Services.AddRateLimiter(options =>
+builder.Services.AddHttpClient("espn", client =>
 {
-    options.AddFixedWindowLimiter("login", limiter =>
-    {
-        limiter.Window = TimeSpan.FromMinutes(1);
-        limiter.PermitLimit = 5;
-        limiter.QueueLimit = 0;
-    });
-
-    options.AddFixedWindowLimiter("submit", limiter =>
-    {
-        limiter.Window = TimeSpan.FromMinutes(1);
-        limiter.PermitLimit = 10;
-        limiter.QueueLimit = 0;
-    });
-
-    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    client.Timeout = TimeSpan.FromSeconds(45);
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 NBA-Player-Lab/1.0");
+    client.DefaultRequestHeaders.Accept.ParseAdd("application/json");
 });
-
-builder.Services
-    .AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
-    .AddCookie(options =>
-    {
-        options.LoginPath = "/";
-        options.Cookie.Name = "PromptShare.Auth";
-        options.Cookie.HttpOnly = true;
-        options.Cookie.SameSite = SameSiteMode.Strict;
-        options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
-        options.SlidingExpiration = true;
-        options.ExpireTimeSpan = TimeSpan.FromHours(8);
-    });
-
-builder.Services.AddAuthorization(options =>
-{
-    options.AddPolicy("AdminOnly", policy => policy.RequireRole("admin"));
-});
-builder.Services.AddDataProtection();
 
 var app = builder.Build();
-var settings = AppSettings.Load(app.Configuration, app.Environment);
 
-InitializeDatabase(settings.DatabasePath);
-
-app.UseForwardedHeaders(new ForwardedHeadersOptions
+var dataDirectory = Path.Combine(app.Environment.ContentRootPath, "App_Data");
+var dataFile = Path.Combine(dataDirectory, "nba-players.json");
+var jsonOptions = new JsonSerializerOptions(JsonSerializerDefaults.Web)
 {
-    ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto
+    WriteIndented = true
+};
+
+var playerApi = app.MapGroup("/api/players");
+
+playerApi.MapGet("/", () => TypedResults.Ok(ReadPlayers()));
+
+playerApi.MapPut("/", async (IReadOnlyList<PlayerProfile> players) =>
+{
+    if (players.Count == 0)
+    {
+        return Results.BadRequest(new { message = "At least one player is required." });
+    }
+
+    var normalized = players.Select(NormalizePlayer).ToList();
+    await SavePlayers(normalized);
+
+    return Results.Ok(normalized);
 });
 
-app.Use(async (context, next) =>
+playerApi.MapPost("/sync-nba", async (IHttpClientFactory httpClientFactory) =>
 {
-    context.Response.Headers.TryAdd("X-Content-Type-Options", "nosniff");
-    context.Response.Headers.TryAdd("X-Frame-Options", "DENY");
-    context.Response.Headers.TryAdd("Referrer-Policy", "no-referrer");
-    context.Response.Headers.TryAdd("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
-    context.Response.Headers.TryAdd(
-        "Content-Security-Policy",
-        "default-src 'self'; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'");
-    await next();
+    try
+    {
+        var players = await ImportEspnPlayers(httpClientFactory.CreateClient("espn"));
+        if (players.Count == 0)
+        {
+            return Results.Problem("ESPN returned no active NBA roster players.", statusCode: 502);
+        }
+
+        await SavePlayers(players);
+        return Results.Ok(new SyncResult(players.Count, "ESPN NBA 2025-26 rosters and regular-season statistics"));
+    }
+    catch (Exception exception)
+    {
+        return Results.Problem($"NBA sync failed: {exception.Message}", statusCode: 502);
+    }
 });
 
 app.UseDefaultFiles();
 app.UseStaticFiles();
-app.UseRateLimiter();
-app.UseAuthentication();
-app.UseAuthorization();
-
-app.MapGet("/api/captcha", (IDataProtectionProvider protectionProvider) =>
-{
-    var left = RandomNumberGenerator.GetInt32(2, 13);
-    var right = RandomNumberGenerator.GetInt32(2, 13);
-    var nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(12));
-    var protector = protectionProvider.CreateProtector("captcha-v2");
-    var token = protector.Protect($"{left + right}|{DateTimeOffset.UtcNow:O}|{nonce}");
-
-    return Results.Ok(new CaptchaResponse($"{left} + {right} = ?", token));
-});
-
-app.MapPost("/api/login", async (
-    LoginRequest request,
-    HttpContext httpContext,
-    IDataProtectionProvider protectionProvider) =>
-{
-    if (!IsCaptchaValid(request.CaptchaAnswer, request.CaptchaToken, protectionProvider))
-    {
-        return Results.BadRequest(new ApiMessage("Invalid or expired captcha."));
-    }
-
-    if (!IsUsernameValid(request.Username) || string.IsNullOrWhiteSpace(request.Password))
-    {
-        await Task.Delay(RandomNumberGenerator.GetInt32(120, 280));
-        return Results.BadRequest(new ApiMessage("Incorrect username or password."));
-    }
-
-    using var connection = OpenConnection(settings.DatabasePath);
-    var user = FindUser(connection, request.Username!);
-    if (user is null || !VerifyPassword(request.Password, user.PasswordHash, user.PasswordSalt))
-    {
-        await Task.Delay(RandomNumberGenerator.GetInt32(120, 280));
-        return Results.BadRequest(new ApiMessage("Incorrect username or password."));
-    }
-
-    var claims = new[]
-    {
-        new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
-        new Claim(ClaimTypes.Name, user.Username),
-        new Claim(ClaimTypes.Role, user.Role)
-    };
-    var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
-    await httpContext.SignInAsync(new ClaimsPrincipal(identity));
-
-    return Results.Ok(new ApiMessage("Signed in."));
-}).RequireRateLimiting("login");
-
-app.MapPost("/api/register", async (
-    RegisterRequest request,
-    HttpContext httpContext,
-    IDataProtectionProvider protectionProvider) =>
-{
-    if (!IsCaptchaValid(request.CaptchaAnswer, request.CaptchaToken, protectionProvider))
-    {
-        return Results.BadRequest(new ApiMessage("Invalid or expired captcha."));
-    }
-
-    if (!IsUsernameValid(request.Username))
-    {
-        return Results.BadRequest(new ApiMessage("Username must be 3-24 characters and use only letters, numbers, underscore, or dash."));
-    }
-
-    if (string.IsNullOrWhiteSpace(request.Password) || request.Password.Length < 8 || request.Password.Length > 128)
-    {
-        return Results.BadRequest(new ApiMessage("Password must be 8-128 characters."));
-    }
-
-    using var connection = OpenConnection(settings.DatabasePath);
-    if (FindUser(connection, request.Username!) is not null)
-    {
-        return Results.Conflict(new ApiMessage("Username is already taken."));
-    }
-
-    var role = CountUsers(connection) == 0 ? "admin" : "user";
-    var user = CreateUser(connection, request.Username!, request.Password, role);
-    var claims = new[]
-    {
-        new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
-        new Claim(ClaimTypes.Name, user.Username),
-        new Claim(ClaimTypes.Role, user.Role)
-    };
-    var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
-    await httpContext.SignInAsync(new ClaimsPrincipal(identity));
-
-    return Results.Ok(new RegisterResult("Account created.", user.Username, user.Role));
-}).RequireRateLimiting("login");
-
-app.MapPost("/api/logout", async (HttpContext httpContext) =>
-{
-    await httpContext.SignOutAsync();
-    return Results.Ok(new ApiMessage("Signed out."));
-});
-
-app.MapGet("/api/me", (ClaimsPrincipal user) =>
-{
-    var authenticated = user.Identity?.IsAuthenticated == true;
-    return Results.Ok(new
-    {
-        authenticated,
-        username = authenticated ? user.Identity?.Name : null,
-        role = authenticated ? user.FindFirstValue(ClaimTypes.Role) : null,
-        canDelete = user.IsInRole("admin")
-    });
-});
-
-app.MapGet("/api/stats", () =>
-{
-    using var connection = OpenConnection(settings.DatabasePath);
-    using var command = connection.CreateCommand();
-    command.CommandText = """
-        SELECT
-            COUNT(*),
-            COALESCE(ROUND(AVG(Score), 1), 0),
-            COALESCE(MAX(Score), 0),
-            COALESCE(SUM(ReportCount), 0)
-        FROM Submissions
-        """;
-
-    using var reader = command.ExecuteReader();
-    reader.Read();
-
-    return Results.Ok(new StatsDto(
-        reader.GetInt32(0),
-        reader.GetDouble(1),
-        reader.GetInt32(2),
-        reader.GetInt32(3),
-        settings.PassingScore));
-});
-
-app.MapGet("/api/submissions", (string? q, string? tag, int? minScore, int? page, int? pageSize) =>
-{
-    var safePage = Math.Max(page ?? 1, 1);
-    var safePageSize = Math.Clamp(pageSize ?? 20, 1, 50);
-    var offset = (safePage - 1) * safePageSize;
-    var filters = new List<string>();
-
-    using var connection = OpenConnection(settings.DatabasePath);
-    using var command = connection.CreateCommand();
-
-    if (!string.IsNullOrWhiteSpace(q))
-    {
-        filters.Add("(Title LIKE $query OR Conversation LIKE $query OR Feedback LIKE $query)");
-        command.Parameters.AddWithValue("$query", $"%{q.Trim()}%");
-    }
-
-    if (!string.IsNullOrWhiteSpace(tag))
-    {
-        filters.Add("Tags LIKE $tag");
-        command.Parameters.AddWithValue("$tag", $"%{tag.Trim()}%");
-    }
-
-    if (minScore is not null)
-    {
-        filters.Add("Score >= $minScore");
-        command.Parameters.AddWithValue("$minScore", Math.Clamp(minScore.Value, 0, 100));
-    }
-
-    var whereClause = filters.Count == 0 ? "" : $"WHERE {string.Join(" AND ", filters)}";
-    command.CommandText = $"""
-        SELECT Id, Title, Author, Tags, Conversation, Score, Feedback, CreatedAt, ReportCount
-        FROM Submissions
-        {whereClause}
-        ORDER BY CreatedAt DESC
-        LIMIT $limit OFFSET $offset
-        """;
-    command.Parameters.AddWithValue("$limit", safePageSize);
-    command.Parameters.AddWithValue("$offset", offset);
-
-    using var reader = command.ExecuteReader();
-    var submissions = new List<SubmissionDto>();
-    while (reader.Read())
-    {
-        submissions.Add(new SubmissionDto(
-            reader.GetInt32(0),
-            reader.GetString(1),
-            reader.GetString(2),
-            reader.GetString(3),
-            reader.GetString(4),
-            reader.GetInt32(5),
-            reader.GetString(6),
-            reader.GetString(7),
-            reader.GetInt32(8)));
-    }
-
-    return Results.Ok(new PagedResponse<SubmissionDto>(submissions, safePage, safePageSize));
-});
-
-app.MapPost("/api/score", (SubmissionRequest request) =>
-{
-    var validation = ValidateSubmission(request, settings);
-    if (validation is not null)
-    {
-        return Results.BadRequest(validation);
-    }
-
-    var result = ScoreConversation(request.Conversation);
-    return Results.Ok(new ScorePreview(result.Score, result.Feedback, result.Breakdown));
-}).RequireAuthorization().RequireRateLimiting("submit");
-
-app.MapPost("/api/submissions", (SubmissionRequest request, ClaimsPrincipal user) =>
-{
-    var validation = ValidateSubmission(request, settings);
-    if (validation is not null)
-    {
-        return Results.BadRequest(validation);
-    }
-
-    var result = ScoreConversation(request.Conversation);
-    if (result.Score < settings.PassingScore)
-    {
-        return Results.Ok(new SubmissionResult(false, result.Score, result.Feedback, result.Breakdown, "Score is below the sharing threshold."));
-    }
-
-    var fingerprint = Fingerprint(request.Conversation);
-    using var connection = OpenConnection(settings.DatabasePath);
-
-    if (SubmissionExists(connection, fingerprint))
-    {
-        return Results.Conflict(new ApiMessage("This conversation is already shared."));
-    }
-
-    using var command = connection.CreateCommand();
-    command.CommandText = """
-        INSERT INTO Submissions (Title, Author, Tags, Conversation, ContentHash, Score, Feedback, CreatedAt, ReportCount)
-        VALUES ($title, $author, $tags, $conversation, $contentHash, $score, $feedback, $createdAt, 0)
-        """;
-    command.Parameters.AddWithValue("$title", request.Title.Trim());
-    command.Parameters.AddWithValue("$author", string.IsNullOrWhiteSpace(request.Author)
-        ? user.Identity?.Name ?? ""
-        : CleanOptional(request.Author, 40));
-    command.Parameters.AddWithValue("$tags", CleanTags(request.Tags));
-    command.Parameters.AddWithValue("$conversation", request.Conversation.Trim());
-    command.Parameters.AddWithValue("$contentHash", fingerprint);
-    command.Parameters.AddWithValue("$score", result.Score);
-    command.Parameters.AddWithValue("$feedback", result.Feedback);
-    command.Parameters.AddWithValue("$createdAt", DateTimeOffset.UtcNow.ToString("yyyy-MM-dd HH:mm:ss 'UTC'"));
-    command.ExecuteNonQuery();
-
-    return Results.Ok(new SubmissionResult(true, result.Score, result.Feedback, result.Breakdown, "Saved to the shared library."));
-}).RequireAuthorization().RequireRateLimiting("submit");
-
-app.MapPost("/api/submissions/{id:int}/report", (int id) =>
-{
-    using var connection = OpenConnection(settings.DatabasePath);
-    using var command = connection.CreateCommand();
-    command.CommandText = "UPDATE Submissions SET ReportCount = ReportCount + 1 WHERE Id = $id";
-    command.Parameters.AddWithValue("$id", id);
-    var changed = command.ExecuteNonQuery();
-
-    return changed == 0
-        ? Results.NotFound(new ApiMessage("Submission not found."))
-        : Results.Ok(new ApiMessage("Report received."));
-}).RequireRateLimiting("submit");
-
-app.MapDelete("/api/submissions/{id:int}", (int id) =>
-{
-    using var connection = OpenConnection(settings.DatabasePath);
-    using var command = connection.CreateCommand();
-    command.CommandText = "DELETE FROM Submissions WHERE Id = $id";
-    command.Parameters.AddWithValue("$id", id);
-    var changed = command.ExecuteNonQuery();
-
-    return changed == 0
-        ? Results.NotFound(new ApiMessage("Submission not found."))
-        : Results.Ok(new ApiMessage("Deleted."));
-}).RequireAuthorization("AdminOnly");
-
 app.MapFallbackToFile("index.html");
 
 app.Run();
 
-static ApiMessage? ValidateSubmission(SubmissionRequest request, AppSettings settings)
+List<PlayerProfile> ReadPlayers()
 {
-    if (string.IsNullOrWhiteSpace(request.Title) || request.Title.Length > 80)
+    if (!File.Exists(dataFile))
     {
-        return new ApiMessage("Title is required and must be 80 characters or fewer.");
+        return SeedPlayers();
     }
 
-    if (string.IsNullOrWhiteSpace(request.Conversation) ||
-        request.Conversation.Length < 30 ||
-        request.Conversation.Length > settings.MaxConversationLength)
+    using var stream = File.OpenRead(dataFile);
+    var players = JsonSerializer.Deserialize<List<PlayerProfile>>(stream, jsonOptions) ?? [];
+
+    return players.Count == 0
+        ? SeedPlayers()
+        : players.Select(NormalizePlayer).ToList();
+}
+
+async Task SavePlayers(IReadOnlyList<PlayerProfile> players)
+{
+    Directory.CreateDirectory(dataDirectory);
+
+    await using var stream = File.Create(dataFile);
+    await JsonSerializer.SerializeAsync(stream, players, jsonOptions);
+}
+
+async Task<List<PlayerProfile>> ImportEspnPlayers(HttpClient httpClient)
+{
+    var stats = await LoadSeasonStats(httpClient);
+    using var teamDocument = await GetJson(httpClient, "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams");
+    var teams = teamDocument.RootElement
+        .GetProperty("sports")[0]
+        .GetProperty("leagues")[0]
+        .GetProperty("teams");
+
+    var players = new Dictionary<string, PlayerProfile>(StringComparer.OrdinalIgnoreCase);
+
+    foreach (var teamEntry in teams.EnumerateArray())
     {
-        return new ApiMessage($"Conversation must be between 30 and {settings.MaxConversationLength} characters.");
+        var team = teamEntry.GetProperty("team");
+        var teamName = GetString(team, "displayName", GetString(team, "name", "NBA Team"));
+        var teamAbbreviation = GetString(team, "abbreviation", "");
+        var rosterKey = teamAbbreviation.ToLowerInvariant();
+
+        if (string.IsNullOrWhiteSpace(rosterKey))
+        {
+            continue;
+        }
+
+        using var rosterDocument = await GetJson(
+            httpClient,
+            $"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{rosterKey}/roster");
+
+        if (!rosterDocument.RootElement.TryGetProperty("athletes", out var athletes))
+        {
+            continue;
+        }
+
+        foreach (var athlete in athletes.EnumerateArray())
+        {
+            if (GetString(athlete.GetProperty("status"), "type", "active") != "active")
+            {
+                continue;
+            }
+
+            var espnId = GetString(athlete, "id", "");
+            if (string.IsNullOrWhiteSpace(espnId) || players.ContainsKey(espnId))
+            {
+                continue;
+            }
+
+            stats.TryGetValue(espnId, out var statLine);
+            var positionCode = GetString(athlete.GetProperty("position"), "abbreviation", "");
+            var position = TranslatePosition(positionCode);
+            var heightInches = GetDouble(athlete, "height", DefaultHeightInches(position));
+            var height = Clamp((int)Math.Round(heightInches * 2.54), 150, 240);
+            var weight = Clamp((int)Math.Round(GetDouble(athlete, "weight", 215) * 0.45359237), 60, 180);
+            var wingspan = Clamp(height + PositionReachBonus(position), 150, 260);
+            var reach = Clamp((int)Math.Round(height * 1.31 + PositionReachBonus(position) * 1.5), 190, 330);
+            var vertical = EstimateVertical(position, statLine);
+            var attributes = BuildAttributes(position, height, weight, statLine, GetInt(athlete.GetProperty("experience"), "years", 0));
+
+            players[espnId] = NormalizePlayer(new PlayerProfile(
+                $"espn-{espnId}",
+                GetString(athlete, "displayName", "Unknown Player"),
+                position,
+                BuildStyle(position, statLine),
+                GetString(athlete.GetProperty("headshot"), "href", ""),
+                teamName,
+                teamAbbreviation,
+                GetString(athlete, "jersey", ""),
+                espnId,
+                height,
+                weight,
+                wingspan,
+                reach,
+                vertical,
+                BuildNotes(teamAbbreviation, position, statLine),
+                statLine,
+                attributes));
+        }
     }
 
-    if (request.Author?.Length > 40)
+    return players.Values
+        .OrderBy(player => player.TeamAbbreviation)
+        .ThenBy(player => PositionOrder(player.Position))
+        .ThenBy(player => player.Name)
+        .ToList();
+}
+
+async Task<Dictionary<string, PlayerStats>> LoadSeasonStats(HttpClient httpClient)
+{
+    const string url = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/statistics/byathlete?region=us&lang=en&contentorigin=espn&isqualified=false&limit=1000&season=2026&seasontype=2&sort=offensive.avgPoints:desc";
+    using var document = await GetJson(httpClient, url);
+    var result = new Dictionary<string, PlayerStats>(StringComparer.OrdinalIgnoreCase);
+
+    if (!document.RootElement.TryGetProperty("athletes", out var athletes))
     {
-        return new ApiMessage("Author must be 40 characters or fewer.");
+        return result;
     }
 
-    if (request.Tags?.Length > 120)
+    foreach (var entry in athletes.EnumerateArray())
     {
-        return new ApiMessage("Tags must be 120 characters or fewer.");
+        if (!entry.TryGetProperty("athlete", out var athlete))
+        {
+            continue;
+        }
+
+        var id = GetString(athlete, "id", "");
+        if (string.IsNullOrWhiteSpace(id) || !entry.TryGetProperty("categories", out var categories))
+        {
+            continue;
+        }
+
+        var general = FindCategory(categories, "general");
+        var offensive = FindCategory(categories, "offensive");
+        var defensive = FindCategory(categories, "defensive");
+
+        result[id] = new PlayerStats(
+            Points: GetValue(offensive, 0),
+            Rebounds: GetValue(general, 11),
+            Assists: GetValue(offensive, 10),
+            Steals: GetValue(defensive, 0),
+            Blocks: GetValue(defensive, 1),
+            ThreeMade: GetValue(offensive, 4),
+            ThreePct: GetValue(offensive, 6),
+            Minutes: GetValue(general, 1),
+            Games: GetValue(general, 0));
+    }
+
+    return result;
+}
+
+async Task<JsonDocument> GetJson(HttpClient httpClient, string url)
+{
+    await using var stream = await httpClient.GetStreamAsync(url);
+    return await JsonDocument.ParseAsync(stream);
+}
+
+PlayerProfile NormalizePlayer(PlayerProfile player)
+{
+    var id = Required(player.Id, Guid.NewGuid().ToString("N"));
+    var attributes = player.Attributes ?? new PlayerAttributes(70, 70, 70, 70, 70, 70);
+    var stats = player.Stats ?? new PlayerStats(0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    return player with
+    {
+        Id = id,
+        Name = Required(player.Name, "未命名球员"),
+        Position = Required(player.Position, "后卫"),
+        Style = Required(player.Style, "待评估"),
+        PhotoUrl = player.PhotoUrl?.Trim() ?? "",
+        TeamName = Required(player.TeamName, "自由球员"),
+        TeamAbbreviation = Required(player.TeamAbbreviation, "FA"),
+        Jersey = player.Jersey?.Trim() ?? "",
+        EspnId = player.EspnId?.Trim() ?? "",
+        Height = Clamp(player.Height, 150, 240),
+        Weight = Clamp(player.Weight, 60, 180),
+        Wingspan = Clamp(player.Wingspan, 150, 260),
+        Reach = Clamp(player.Reach, 190, 330),
+        Vertical = Clamp(player.Vertical, 30, 130),
+        Notes = player.Notes?.Trim() ?? "",
+        Stats = stats,
+        Attributes = new PlayerAttributes(
+            Clamp(attributes.Dribble, 0, 100),
+            Clamp(attributes.Shooting, 0, 100),
+            Clamp(attributes.Iq, 0, 100),
+            Clamp(attributes.Personality, 0, 100),
+            Clamp(attributes.Body, 0, 100),
+            Clamp(attributes.Mental, 0, 100))
+    };
+}
+
+static JsonElement? FindCategory(JsonElement categories, string name)
+{
+    foreach (var category in categories.EnumerateArray())
+    {
+        if (GetString(category, "name", "") == name)
+        {
+            return category;
+        }
     }
 
     return null;
 }
 
-static void InitializeDatabase(string databasePath)
+static double GetValue(JsonElement? category, int index)
 {
-    var directory = Path.GetDirectoryName(databasePath);
-    if (!string.IsNullOrWhiteSpace(directory))
+    if (category is null ||
+        !category.Value.TryGetProperty("values", out var values) ||
+        values.ValueKind != JsonValueKind.Array ||
+        values.GetArrayLength() <= index)
     {
-        Directory.CreateDirectory(directory);
+        return 0;
     }
 
-    using var connection = OpenConnection(databasePath);
-    using var command = connection.CreateCommand();
-    command.CommandText = """
-        CREATE TABLE IF NOT EXISTS Submissions (
-            Id INTEGER PRIMARY KEY AUTOINCREMENT,
-            Title TEXT NOT NULL,
-            Author TEXT NOT NULL DEFAULT '',
-            Tags TEXT NOT NULL DEFAULT '',
-            Conversation TEXT NOT NULL,
-            ContentHash TEXT NOT NULL DEFAULT '',
-            Score INTEGER NOT NULL,
-            Feedback TEXT NOT NULL,
-            CreatedAt TEXT NOT NULL,
-            ReportCount INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS IX_Submissions_ContentHash ON Submissions(ContentHash);
-
-        CREATE TABLE IF NOT EXISTS Users (
-            Id INTEGER PRIMARY KEY AUTOINCREMENT,
-            Username TEXT NOT NULL UNIQUE,
-            PasswordHash TEXT NOT NULL,
-            PasswordSalt TEXT NOT NULL,
-            Role TEXT NOT NULL DEFAULT 'user',
-            CreatedAt TEXT NOT NULL
-        );
-        """;
-    command.ExecuteNonQuery();
-
-    EnsureColumn(connection, "Author", "TEXT NOT NULL DEFAULT ''");
-    EnsureColumn(connection, "Tags", "TEXT NOT NULL DEFAULT ''");
-    EnsureColumn(connection, "ContentHash", "TEXT NOT NULL DEFAULT ''");
-    EnsureColumn(connection, "ReportCount", "INTEGER NOT NULL DEFAULT 0");
+    return values[index].GetDouble();
 }
 
-static void EnsureColumn(SqliteConnection connection, string name, string definition)
+static PlayerAttributes BuildAttributes(string position, int height, int weight, PlayerStats? stats, int experience)
 {
-    using var exists = connection.CreateCommand();
-    exists.CommandText = "SELECT COUNT(*) FROM pragma_table_info('Submissions') WHERE name = $name";
-    exists.Parameters.AddWithValue("$name", name);
-    var hasColumn = Convert.ToInt32(exists.ExecuteScalar()) > 0;
-    if (hasColumn)
+    stats ??= new PlayerStats(0, 0, 0, 0, 0, 0, 0, 0, 0);
+    var production = stats.Points + stats.Rebounds * 1.15 + stats.Assists * 1.35 + stats.Steals * 2 + stats.Blocks * 2;
+    var role = ClampDouble(54 + stats.Minutes * 1.05 + production * 0.56, 48, 99);
+    var sizeScore = position switch
     {
-        return;
+        "中锋" => (height - 198) * 0.9 + (weight - 95) * 0.35,
+        "大前锋" => (height - 195) * 0.8 + (weight - 90) * 0.3,
+        "小前锋" => (height - 190) * 0.75 + (weight - 84) * 0.28,
+        _ => (height - 182) * 0.65 + (weight - 78) * 0.2
+    };
+
+    var dribbleBase = position is "控球后卫" or "得分后卫" ? 64 : position == "小前锋" ? 59 : 52;
+    var shootBase = position is "控球后卫" or "得分后卫" ? 60 : position == "中锋" ? 50 : 56;
+
+    return new PlayerAttributes(
+        Dribble: Score(dribbleBase + stats.Assists * 3.8 + stats.Points * 0.7 + role * 0.12),
+        Shooting: Score(shootBase + stats.Points * 0.95 + stats.ThreeMade * 5.8 + stats.ThreePct * 0.16),
+        Iq: Score(58 + stats.Assists * 4.1 + stats.Minutes * 0.72 + experience * 1.6),
+        Personality: Score(68 + stats.Games * 0.16 + stats.Minutes * 0.35 + experience * 1.2),
+        Body: Score(56 + sizeScore + stats.Rebounds * 2.1 + stats.Blocks * 4.2),
+        Mental: Score(62 + stats.Games * 0.18 + stats.Minutes * 0.48 + production * 0.42));
+}
+
+static string BuildStyle(string position, PlayerStats? stats)
+{
+    stats ??= new PlayerStats(0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    if (stats.Points >= 25)
+    {
+        return "核心得分 / 持球攻坚";
     }
 
-    using var alter = connection.CreateCommand();
-    alter.CommandText = $"ALTER TABLE Submissions ADD COLUMN {name} {definition}";
-    alter.ExecuteNonQuery();
-}
-
-static SqliteConnection OpenConnection(string databasePath)
-{
-    var connection = new SqliteConnection($"Data Source={databasePath}");
-    connection.Open();
-    using var pragma = connection.CreateCommand();
-    pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;";
-    pragma.ExecuteNonQuery();
-    return connection;
-}
-
-static bool IsCaptchaValid(string? answer, string? token, IDataProtectionProvider protectionProvider)
-{
-    if (!int.TryParse(answer?.Trim(), out var submittedAnswer) || string.IsNullOrWhiteSpace(token))
+    if (stats.Assists >= 6)
     {
-        return false;
+        return "组织发动 / 挡拆处理";
     }
 
-    try
+    if (stats.Rebounds >= 8 || stats.Blocks >= 1.2)
     {
-        var protector = protectionProvider.CreateProtector("captcha-v2");
-        var payload = protector.Unprotect(token).Split('|');
-        var expectedAnswer = int.Parse(payload[0]);
-        var createdAt = DateTimeOffset.Parse(payload[1]);
-
-        return submittedAnswer == expectedAnswer &&
-            DateTimeOffset.UtcNow - createdAt < TimeSpan.FromMinutes(5);
-    }
-    catch
-    {
-        return false;
-    }
-}
-
-static bool SubmissionExists(SqliteConnection connection, string fingerprint)
-{
-    using var command = connection.CreateCommand();
-    command.CommandText = "SELECT 1 FROM Submissions WHERE ContentHash = $contentHash LIMIT 1";
-    command.Parameters.AddWithValue("$contentHash", fingerprint);
-    return command.ExecuteScalar() is not null;
-}
-
-static int CountUsers(SqliteConnection connection)
-{
-    using var command = connection.CreateCommand();
-    command.CommandText = "SELECT COUNT(*) FROM Users";
-    return Convert.ToInt32(command.ExecuteScalar());
-}
-
-static UserAccount? FindUser(SqliteConnection connection, string username)
-{
-    using var command = connection.CreateCommand();
-    command.CommandText = """
-        SELECT Id, Username, PasswordHash, PasswordSalt, Role
-        FROM Users
-        WHERE lower(Username) = lower($username)
-        LIMIT 1
-        """;
-    command.Parameters.AddWithValue("$username", username.Trim());
-
-    using var reader = command.ExecuteReader();
-    if (!reader.Read())
-    {
-        return null;
+        return "篮板护框 / 内线终结";
     }
 
-    return new UserAccount(
-        reader.GetInt32(0),
-        reader.GetString(1),
-        reader.GetString(2),
-        reader.GetString(3),
-        reader.GetString(4));
-}
-
-static UserAccount CreateUser(SqliteConnection connection, string username, string password, string role)
-{
-    var salt = RandomNumberGenerator.GetBytes(16);
-    var hash = HashPassword(password, salt);
-
-    using var command = connection.CreateCommand();
-    command.CommandText = """
-        INSERT INTO Users (Username, PasswordHash, PasswordSalt, Role, CreatedAt)
-        VALUES ($username, $passwordHash, $passwordSalt, $role, $createdAt)
-        RETURNING Id
-        """;
-    command.Parameters.AddWithValue("$username", username.Trim());
-    command.Parameters.AddWithValue("$passwordHash", Convert.ToBase64String(hash));
-    command.Parameters.AddWithValue("$passwordSalt", Convert.ToBase64String(salt));
-    command.Parameters.AddWithValue("$role", role);
-    command.Parameters.AddWithValue("$createdAt", DateTimeOffset.UtcNow.ToString("yyyy-MM-dd HH:mm:ss 'UTC'"));
-    var id = Convert.ToInt32(command.ExecuteScalar());
-
-    return new UserAccount(id, username.Trim(), Convert.ToBase64String(hash), Convert.ToBase64String(salt), role);
-}
-
-static bool VerifyPassword(string password, string storedHash, string storedSalt)
-{
-    var salt = Convert.FromBase64String(storedSalt);
-    var expectedHash = Convert.FromBase64String(storedHash);
-    var candidateHash = HashPassword(password, salt);
-    return CryptographicOperations.FixedTimeEquals(candidateHash, expectedHash);
-}
-
-static byte[] HashPassword(string password, byte[] salt) =>
-    Rfc2898DeriveBytes.Pbkdf2(
-        password,
-        salt,
-        100_000,
-        HashAlgorithmName.SHA256,
-        32);
-
-static bool IsUsernameValid(string? username)
-{
-    if (string.IsNullOrWhiteSpace(username))
+    if (stats.ThreeMade >= 2)
     {
-        return false;
+        return "外线投射 / 空间牵制";
     }
 
-    var trimmed = username.Trim();
-    return trimmed.Length is >= 3 and <= 24 &&
-        trimmed.All(character => char.IsLetterOrDigit(character) || character is '_' or '-');
-}
-
-static string Fingerprint(string value)
-{
-    var normalized = string.Join(' ', value.Trim().Split(Array.Empty<char>(), StringSplitOptions.RemoveEmptyEntries));
-    return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized))).ToLowerInvariant();
-}
-
-static string CleanOptional(string? value, int maxLength)
-{
-    if (string.IsNullOrWhiteSpace(value))
+    return position switch
     {
-        return "";
+        "控球后卫" => "控运组织 / 外线轮转",
+        "得分后卫" => "侧翼得分 / 防守轮转",
+        "小前锋" => "锋线摇摆 / 攻防转换",
+        "大前锋" => "前场终结 / 篮板协防",
+        "中锋" => "禁区终结 / 掩护护框",
+        _ => "轮换角色 / 待评估"
+    };
+}
+
+static string BuildNotes(string team, string position, PlayerStats? stats)
+{
+    stats ??= new PlayerStats(0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    if (stats.Games == 0)
+    {
+        return $"{team} {position}，暂无 2025-26 常规赛统计，评分主要来自身材、位置和角色模板。";
     }
 
-    var trimmed = value.Trim();
-    return trimmed[..Math.Min(trimmed.Length, maxLength)];
+    return $"{team} {position}，2025-26 常规赛场均 {stats.Points:0.0} 分、{stats.Rebounds:0.0} 篮板、{stats.Assists:0.0} 助攻，六边形评分由表现、位置和体测估算生成。";
 }
 
-static string CleanTags(string? value)
+static int EstimateVertical(string position, PlayerStats? stats)
 {
-    if (string.IsNullOrWhiteSpace(value))
+    stats ??= new PlayerStats(0, 0, 0, 0, 0, 0, 0, 0, 0);
+    var baseValue = position switch
     {
-        return "";
-    }
+        "控球后卫" => 86,
+        "得分后卫" => 89,
+        "小前锋" => 88,
+        "大前锋" => 83,
+        "中锋" => 78,
+        _ => 82
+    };
 
-    var tags = value
-        .Split(',', '#')
-        .Select(tag => tag.Trim())
-        .Where(tag => tag.Length > 0)
-        .Distinct(StringComparer.OrdinalIgnoreCase)
-        .Take(8);
-
-    return string.Join(", ", tags);
+    return Clamp((int)Math.Round(baseValue + stats.Points * 0.18 + stats.Blocks * 2.2 + stats.Steals * 1.2), 30, 130);
 }
 
-static ScoreResult ScoreConversation(string conversation)
+static string TranslatePosition(string abbreviation) => abbreviation.ToUpperInvariant() switch
 {
-    var score = 35;
-    var feedback = new List<string>();
-    var breakdown = new List<ScoreBreakdown>();
+    "PG" => "控球后卫",
+    "SG" => "得分后卫",
+    "G" => "后卫",
+    "SF" => "小前锋",
+    "PF" => "大前锋",
+    "F" => "前锋",
+    "C" => "中锋",
+    _ => "未标注"
+};
 
-    AddScore(conversation.Length >= 300, 15, "Length", "Enough detail for review.", "Add more context and detail.");
-    AddScore(HasAny(conversation, "user", "question", "request"), 10, "User turn", "Includes the user request.", "Keep the original user request.");
-    AddScore(HasAny(conversation, "assistant", "model", "answer"), 10, "Assistant turn", "Includes the model answer.", "Keep the model answer.");
-    AddScore(HasAny(conversation, "context", "goal", "requirement", "constraint"), 10, "Context", "Includes context, goals, or constraints.", "Add context, goals, or constraints.");
-    AddScore(HasAny(conversation, "example", "steps", "code", "summary"), 10, "Reuse value", "Includes examples, steps, code, or a summary.", "Add examples, steps, code, or a summary.");
-    AddScore(conversation.Split('\n').Length >= 4, 10, "Structure", "Readable line structure.", "Split the conversation into readable turns.");
-    AddScore(!HasAny(conversation, "password is", "credit card", "id card", "phone number"), 10, "Privacy", "No obvious sensitive keywords.", "Remove passwords, payment data, IDs, or phone numbers.");
-
-    score = Math.Clamp(score, 0, 100);
-    var feedbackText = feedback.Count == 0 ? "Complete, clear, and useful for sharing." : string.Join(" ", feedback);
-
-    return new ScoreResult(score, feedbackText, breakdown);
-
-    void AddScore(bool passed, int points, string name, string positive, string negative)
-    {
-        if (passed)
-        {
-            score += points;
-        }
-        else
-        {
-            feedback.Add(negative);
-        }
-
-        breakdown.Add(new ScoreBreakdown(name, passed ? points : 0, points, passed ? positive : negative));
-    }
-}
-
-static bool HasAny(string text, params string[] words) =>
-    words.Any(word => text.Contains(word, StringComparison.OrdinalIgnoreCase));
-
-sealed class AppSettings
+static int PositionReachBonus(string position) => position switch
 {
-    private AppSettings(string databasePath, int passingScore, int maxConversationLength)
-    {
-        DatabasePath = databasePath;
-        PassingScore = passingScore;
-        MaxConversationLength = maxConversationLength;
-    }
+    "控球后卫" or "后卫" => 5,
+    "得分后卫" => 6,
+    "小前锋" or "前锋" => 8,
+    "大前锋" => 10,
+    "中锋" => 12,
+    _ => 7
+};
 
-    public string DatabasePath { get; }
-    public int PassingScore { get; }
-    public int MaxConversationLength { get; }
+static int PositionOrder(string position) => position switch
+{
+    "控球后卫" => 1,
+    "得分后卫" => 2,
+    "后卫" => 3,
+    "小前锋" => 4,
+    "前锋" => 5,
+    "大前锋" => 6,
+    "中锋" => 7,
+    _ => 8
+};
 
-    public static AppSettings Load(IConfiguration configuration, IWebHostEnvironment environment)
-    {
-        var databasePath = configuration["DatabasePath"] ?? Path.Combine(environment.ContentRootPath, "App_Data", "prompt-share.db");
-        var passingScore = configuration.GetValue("PassingScore", 75);
-        var maxConversationLength = configuration.GetValue("MaxConversationLength", 12000);
-        return new AppSettings(databasePath, passingScore, maxConversationLength);
-    }
+static double DefaultHeightInches(string position) => position switch
+{
+    "控球后卫" or "后卫" => 75,
+    "得分后卫" => 77,
+    "小前锋" or "前锋" => 80,
+    "大前锋" => 82,
+    "中锋" => 84,
+    _ => 79
+};
+
+static int Score(double value) => Clamp((int)Math.Round(value), 40, 99);
+
+static double ClampDouble(double value, double min, double max) => Math.Min(Math.Max(value, min), max);
+
+static string Required(string? value, string fallback) =>
+    string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();
+
+static int Clamp(int value, int min, int max) => Math.Min(Math.Max(value, min), max);
+
+static string GetString(JsonElement element, string property, string fallback)
+{
+    return element.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String
+        ? value.GetString() ?? fallback
+        : fallback;
 }
 
-record CaptchaResponse(string Question, string Token);
-record LoginRequest(string? Username, string? Password, string? CaptchaAnswer, string? CaptchaToken);
-record RegisterRequest(string? Username, string? Password, string? CaptchaAnswer, string? CaptchaToken);
-record SubmissionRequest(string Title, string? Author, string? Tags, string Conversation);
-record ApiMessage(string Message);
-record RegisterResult(string Message, string Username, string Role);
-record UserAccount(int Id, string Username, string PasswordHash, string PasswordSalt, string Role);
-record ScoreBreakdown(string Name, int Points, int MaxPoints, string Note);
-record ScoreResult(int Score, string Feedback, IReadOnlyList<ScoreBreakdown> Breakdown);
-record ScorePreview(int Score, string Feedback, IReadOnlyList<ScoreBreakdown> Breakdown);
-record SubmissionResult(bool Saved, int Score, string Feedback, IReadOnlyList<ScoreBreakdown> Breakdown, string Message);
-record SubmissionDto(int Id, string Title, string Author, string Tags, string Conversation, int Score, string Feedback, string CreatedAt, int ReportCount);
-record PagedResponse<T>(IReadOnlyList<T> Items, int Page, int PageSize);
-record StatsDto(int Total, double AverageScore, int HighestScore, int ReportCount, int PassingScore);
+static double GetDouble(JsonElement element, string property, double fallback)
+{
+    return element.TryGetProperty(property, out var value) && value.TryGetDouble(out var number)
+        ? number
+        : fallback;
+}
+
+static int GetInt(JsonElement element, string property, int fallback)
+{
+    return element.TryGetProperty(property, out var value) && value.TryGetInt32(out var number)
+        ? number
+        : fallback;
+}
+
+static List<PlayerProfile> SeedPlayers() =>
+[
+    new(
+        "espn-3975",
+        "Stephen Curry",
+        "控球后卫",
+        "外线投射 / 空间牵制",
+        "assets/headshots/stephen-curry.png",
+        "Golden State Warriors",
+        "GS",
+        "30",
+        "3975",
+        188,
+        84,
+        192,
+        244,
+        91,
+        "示例数据。点击“同步NBA”可导入当前赛季全联盟名单。",
+        new PlayerStats(24.5, 4.4, 6.0, 1.1, 0.4, 4.1, 40.0, 32.0, 60),
+        new PlayerAttributes(93, 99, 96, 90, 74, 95)),
+    new(
+        "espn-1966",
+        "LeBron James",
+        "小前锋",
+        "持球组织 / 终结压迫",
+        "assets/headshots/lebron-james.png",
+        "Los Angeles Lakers",
+        "LAL",
+        "23",
+        "1966",
+        206,
+        113,
+        214,
+        269,
+        102,
+        "示例数据。点击“同步NBA”可导入当前赛季全联盟名单。",
+        new PlayerStats(24.4, 7.8, 8.2, 1.0, 0.6, 2.0, 37.6, 34.0, 60),
+        new PlayerAttributes(88, 84, 98, 92, 97, 96)),
+    new(
+        "espn-3112335",
+        "Nikola Jokic",
+        "中锋",
+        "高位策应 / 低位支点",
+        "assets/headshots/nikola-jokic.png",
+        "Denver Nuggets",
+        "DEN",
+        "15",
+        "3112335",
+        211,
+        129,
+        221,
+        282,
+        71,
+        "示例数据。点击“同步NBA”可导入当前赛季全联盟名单。",
+        new PlayerStats(29.6, 12.7, 10.2, 1.8, 0.7, 2.0, 41.7, 36.0, 65),
+        new PlayerAttributes(79, 89, 99, 88, 91, 94)),
+    new(
+        "espn-4594268",
+        "Anthony Edwards",
+        "得分后卫",
+        "爆发突破 / 强投终结",
+        "assets/headshots/anthony-edwards.png",
+        "Minnesota Timberwolves",
+        "MIN",
+        "5",
+        "4594268",
+        193,
+        102,
+        206,
+        260,
+        105,
+        "示例数据。点击“同步NBA”可导入当前赛季全联盟名单。",
+        new PlayerStats(27.6, 5.7, 4.5, 1.2, 0.6, 3.4, 39.5, 36.3, 64),
+        new PlayerAttributes(90, 87, 84, 93, 94, 92))
+];
+
+public sealed record PlayerProfile(
+    string Id,
+    string Name,
+    string Position,
+    string Style,
+    string PhotoUrl,
+    string TeamName,
+    string TeamAbbreviation,
+    string Jersey,
+    string EspnId,
+    int Height,
+    int Weight,
+    int Wingspan,
+    int Reach,
+    int Vertical,
+    string Notes,
+    PlayerStats? Stats,
+    PlayerAttributes? Attributes);
+
+public sealed record PlayerStats(
+    double Points,
+    double Rebounds,
+    double Assists,
+    double Steals,
+    double Blocks,
+    double ThreeMade,
+    double ThreePct,
+    double Minutes,
+    double Games);
+
+public sealed record PlayerAttributes(
+    int Dribble,
+    int Shooting,
+    int Iq,
+    int Personality,
+    int Body,
+    int Mental);
+
+public sealed record SyncResult(int Count, string Source);

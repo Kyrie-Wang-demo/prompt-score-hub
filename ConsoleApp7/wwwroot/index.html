@@ -1,149 +1,186 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Prompt Score Hub</title>
-  <link rel="stylesheet" href="/styles.css">
+  <title>NBA 球员体测与六边形分析</title>
+  <link rel="stylesheet" href="styles.css?v=nba-all-players">
 </head>
 <body>
-  <main class="shell">
-    <section class="workspace">
-      <header class="topbar">
+  <main class="app-shell">
+    <aside class="sidebar" aria-label="球员列表">
+      <div class="brand-block">
+        <span class="league-mark">NBA</span>
         <div>
-          <p class="eyebrow">Open prompt library</p>
-          <h1>Prompt Score Hub</h1>
+          <p class="eyebrow">Player Lab</p>
+          <h1>球员体测数据库</h1>
         </div>
-        <div class="top-actions">
-          <span class="user-pill" id="userBadge" hidden></span>
-          <button class="ghost-button" id="logoutButton" type="button" hidden>Sign out</button>
-        </div>
-      </header>
+      </div>
 
-      <section class="stats-grid" aria-label="Library statistics">
-        <div><span>Total</span><strong id="statTotal">0</strong></div>
-        <div><span>Average</span><strong id="statAverage">0</strong></div>
-        <div><span>Best</span><strong id="statBest">0</strong></div>
-        <div><span>Pass mark</span><strong id="statPass">75</strong></div>
+      <label class="search-box">
+        <span>搜索球员</span>
+        <input id="searchInput" type="search" placeholder="姓名、球队、位置、风格" autocomplete="off">
+      </label>
+
+      <div class="filter-grid">
+        <label>
+          <span>球队</span>
+          <select id="teamFilter"></select>
+        </label>
+        <label>
+          <span>位置</span>
+          <select id="positionFilter"></select>
+        </label>
+        <label>
+          <span>分组</span>
+          <select id="groupBySelect">
+            <option value="team">按球队</option>
+            <option value="position">按位置</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="list-toolbar">
+        <button class="primary-action" id="syncNbaButton" type="button">同步NBA</button>
+        <button class="ghost-action" id="newPlayerButton" type="button">新增</button>
+      </div>
+      <p class="sync-note" id="syncStatus">当前载入 0 名球员</p>
+
+      <div class="player-list" id="playerList"></div>
+    </aside>
+
+    <section class="workspace" aria-label="球员分析工作台">
+      <section class="profile-hero">
+        <img src="assets/photoreal-street-court.png" alt="">
+        <div class="hero-overlay">
+          <div>
+            <p class="eyebrow" id="playerRole">控球后卫</p>
+            <h2 id="playerName">Stephen Curry</h2>
+          </div>
+          <div class="hero-meta" id="heroMeta"></div>
+        </div>
       </section>
 
-      <div class="content-grid">
-        <section class="panel" id="loginPanel">
-          <h2>Account</h2>
-          <div class="auth-tabs">
-            <button class="tab-button active" id="showLogin" type="button">Sign in</button>
-            <button class="tab-button" id="showRegister" type="button">Register</button>
-          </div>
-          <form id="loginForm" class="stack">
-            <label>
-              <span>Username</span>
-              <input id="loginUsername" autocomplete="username" placeholder="your-name" required>
-            </label>
-            <label>
-              <span>Password</span>
-              <input id="password" type="password" autocomplete="current-password" required>
-            </label>
-            <label>
-              <span>Captcha</span>
-              <div class="captcha-row">
-                <strong id="captchaQuestion">Loading...</strong>
-                <button class="icon-button" id="refreshCaptcha" type="button" title="Refresh captcha">R</button>
-              </div>
-              <input id="captchaAnswer" inputmode="numeric" autocomplete="off" placeholder="Answer" required>
-            </label>
-            <button class="primary-button" type="submit">Sign in</button>
-            <p class="message" id="loginMessage"></p>
-          </form>
-          <form id="registerForm" class="stack" hidden>
-            <label>
-              <span>Username</span>
-              <input id="registerUsername" autocomplete="username" placeholder="3-24 letters, numbers, _ or -" required>
-            </label>
-            <label>
-              <span>Password</span>
-              <input id="registerPassword" type="password" autocomplete="new-password" minlength="8" placeholder="At least 8 characters" required>
-            </label>
-            <label>
-              <span>Captcha</span>
-              <div class="captcha-row">
-                <strong id="registerCaptchaQuestion">Loading...</strong>
-                <button class="icon-button" id="refreshRegisterCaptcha" type="button" title="Refresh captcha">R</button>
-              </div>
-              <input id="registerCaptchaAnswer" inputmode="numeric" autocomplete="off" placeholder="Answer" required>
-            </label>
-            <button class="primary-button" type="submit">Create account</button>
-            <p class="hint">The first registered account becomes admin. Later accounts can submit but cannot delete.</p>
-            <p class="message" id="registerMessage"></p>
-          </form>
-        </section>
-
-        <section class="panel" id="submitPanel" hidden>
-          <h2>Submit Conversation</h2>
-          <form id="submitForm" class="stack">
-            <label>
-              <span>Title</span>
-              <input id="title" maxlength="80" placeholder="Support reply improvement" required>
-            </label>
-            <div class="two-col">
-              <label>
-                <span>Author</span>
-                <input id="author" maxlength="40" placeholder="Optional">
-              </label>
-              <label>
-                <span>Tags</span>
-                <input id="tags" maxlength="120" placeholder="support, writing, code">
-              </label>
-            </div>
-            <label>
-              <span>Conversation</span>
-              <textarea id="conversation" rows="14" placeholder="Paste the user and assistant conversation. Strong examples include context, goal, constraints, model answer, and summary." required></textarea>
-            </label>
-            <div class="button-row">
-              <button class="ghost-button" id="previewButton" type="button">Preview score</button>
-              <button class="primary-button" type="submit">Score and publish</button>
-            </div>
-            <div class="score-box" id="scoreBox" hidden>
-              <div>
-                <span>Score</span>
-                <strong id="scoreValue">0</strong>
-              </div>
-              <p id="scoreFeedback"></p>
-              <ul id="scoreBreakdown"></ul>
-            </div>
-          </form>
-        </section>
-
-        <section class="panel library-panel">
-          <div class="section-heading">
+      <section class="analysis-grid">
+        <article class="radar-panel">
+          <header class="section-heading">
             <div>
-              <h2>Shared Library</h2>
-              <p>High-scoring conversations are visible to everyone.</p>
+              <p class="eyebrow">Hex Profile</p>
+              <h3>六边形属性</h3>
             </div>
-            <button class="ghost-button" id="reloadButton" type="button">Refresh</button>
+            <output id="overallScore">0</output>
+          </header>
+          <div class="radar-wrap">
+            <canvas id="radarCanvas" width="520" height="520" aria-label="球员六边形属性图"></canvas>
+          </div>
+          <div class="attribute-grid" id="attributeGrid"></div>
+        </article>
+
+        <article class="body-panel">
+          <header class="section-heading">
+            <div>
+              <p class="eyebrow">Bio Metrics</p>
+              <h3>身体数据</h3>
+            </div>
+          </header>
+          <figure class="body-photo-card">
+            <img id="playerPhoto" alt="球员定妆照">
+            <figcaption id="photoCaption">定妆照</figcaption>
+          </figure>
+          <dl class="metric-grid" id="metricGrid"></dl>
+          <div class="trait-card">
+            <span>综合特性</span>
+            <p id="playerSummary"></p>
+          </div>
+        </article>
+      </section>
+
+      <section class="editor-panel">
+        <header class="section-heading">
+          <div>
+            <p class="eyebrow">Data Editor</p>
+            <h3>球员档案</h3>
+          </div>
+          <button class="danger-action" id="deleteButton" type="button">删除</button>
+        </header>
+
+        <form id="playerForm" class="player-form">
+          <div class="form-grid">
+            <label>
+              <span>姓名</span>
+              <input id="nameInput" name="name" required>
+            </label>
+            <label>
+              <span>球队</span>
+              <input id="teamNameInput" name="teamName" required>
+            </label>
+            <label>
+              <span>队名缩写</span>
+              <input id="teamAbbreviationInput" name="teamAbbreviation" maxlength="5" required>
+            </label>
+            <label>
+              <span>球衣号</span>
+              <input id="jerseyInput" name="jersey" maxlength="4">
+            </label>
+            <label>
+              <span>位置</span>
+              <select id="positionInput" name="position">
+                <option>控球后卫</option>
+                <option>得分后卫</option>
+                <option>后卫</option>
+                <option>小前锋</option>
+                <option>前锋</option>
+                <option>大前锋</option>
+                <option>中锋</option>
+              </select>
+            </label>
+            <label>
+              <span>身高 cm</span>
+              <input id="heightInput" name="height" type="number" min="150" max="240" required>
+            </label>
+            <label>
+              <span>体重 kg</span>
+              <input id="weightInput" name="weight" type="number" min="60" max="180" required>
+            </label>
+            <label>
+              <span>臂展 cm</span>
+              <input id="wingspanInput" name="wingspan" type="number" min="150" max="260" required>
+            </label>
+            <label>
+              <span>站立摸高 cm</span>
+              <input id="reachInput" name="reach" type="number" min="190" max="330" required>
+            </label>
+            <label>
+              <span>垂直弹跳 cm</span>
+              <input id="verticalInput" name="vertical" type="number" min="30" max="130" required>
+            </label>
+            <label>
+              <span>风格标签</span>
+              <input id="styleInput" name="style" required>
+            </label>
+            <label>
+              <span>定妆照 URL</span>
+              <input id="photoUrlInput" name="photoUrl" type="url">
+            </label>
           </div>
 
-          <form class="filters" id="filterForm">
-            <input id="query" placeholder="Search title, feedback, or conversation">
-            <input id="tagFilter" placeholder="Tag">
-            <select id="minScore">
-              <option value="">Any score</option>
-              <option value="90">90+</option>
-              <option value="80">80+</option>
-              <option value="75">75+</option>
-            </select>
-            <button class="ghost-button" type="submit">Search</button>
-          </form>
+          <div class="slider-grid" id="sliderGrid"></div>
 
-          <div class="library-list" id="libraryList"></div>
-          <div class="pager">
-            <button class="ghost-button" id="previousPage" type="button">Previous</button>
-            <span id="pageLabel">Page 1</span>
-            <button class="ghost-button" id="nextPage" type="button">Next</button>
+          <label class="notes-field">
+            <span>分析备注</span>
+            <textarea id="notesInput" name="notes" rows="3"></textarea>
+          </label>
+
+          <div class="form-actions">
+            <button class="primary-action" type="submit">保存档案</button>
           </div>
-        </section>
-      </div>
+        </form>
+      </section>
     </section>
   </main>
-  <script src="/app.js"></script>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="data/nba-players-data.js?v=nba-all-players"></script>
+  <script src="app.js?v=nba-all-players"></script>
 </body>
 </html>
